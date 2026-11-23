@@ -5,7 +5,7 @@ import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import 'dotenv/config';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { db, rows } from './db.js';
 
 if(!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) 
@@ -63,6 +63,35 @@ app.post('/api/setup/first-admin', rateLimit({windowMs:15*60*1000,limit:10,stand
     const user={id:r.insertId,name,email,role:'admin'};
     res.status(201).json({token:tokenFor(user),user});
   } catch(e) { if(e.code==='23505') return error(res,409,'Email already exists'); throw e; }
+}));
+// TEMPORARY, single-use administrator recovery. Remove after successful recovery.
+// Requires ADMIN_RECOVERY_KEY and ADMIN_RECOVERY_USER_ID in Vercel, plus the recovery SQL migration.
+app.post('/api/setup/recover-admin', rateLimit({windowMs:15*60*1000,limit:5,standardHeaders:'draft-7',legacyHeaders:false}), run(async(req,res)=>{
+  const configured=process.env.ADMIN_RECOVERY_KEY;
+  const adminId=int(process.env.ADMIN_RECOVERY_USER_ID);
+  if(!configured || configured.length<32 || !adminId) return error(res,404,'Recovery is disabled');
+  const supplied=typeof req.body?.recoveryKey==='string'?req.body.recoveryKey:'';
+  const a=createHash('sha256').update(supplied).digest();
+  const b=createHash('sha256').update(configured).digest();
+  if(!timingSafeEqual(a,b)) return error(res,403,'Invalid recovery key');
+  const email=text(req.body?.email,190).toLowerCase(), password=req.body?.password;
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || typeof password!=='string' || password.length<12 || password.length>128)
+    return error(res,400,'Enter a valid email and a password of 12–128 characters');
+  const hash=await bcrypt.hash(password,12);
+  const conn=await db.getConnection();
+  try{
+    await conn.beginTransaction();
+    const [[guard]]=await conn.query('SELECT used_at FROM admin_recovery_guard WHERE id=1 FOR UPDATE');
+    if(!guard || guard.used_at){await conn.rollback();return error(res,409,'Recovery already used or not initialized')}
+    const [[admin]]=await conn.query("SELECT id FROM users WHERE id=? AND role='admin' FOR UPDATE",[adminId]);
+    if(!admin){await conn.rollback();return error(res,404,'Configured Administrator account not found')}
+    const [[collision]]=await conn.query('SELECT id FROM users WHERE LOWER(email)=? AND id<>?',[email,adminId]);
+    if(collision){await conn.rollback();return error(res,409,'Email is already used by another account')}
+    await conn.query('UPDATE users SET email=?,password_hash=?,active=TRUE WHERE id=?',[email,hash,adminId]);
+    await conn.query('UPDATE admin_recovery_guard SET used_at=NOW() WHERE id=1');
+    await conn.commit();
+    res.json({message:'Administrator credentials updated. Remove the recovery environment variables and redeploy, then sign in.'});
+  }catch(e){await conn.rollback();throw e}finally{conn.release()}
 }));
 app.post('/api/auth/register',run(async(req,res)=>{const name=text(req.body.name,120),email=text(req.body.email,190).toLowerCase(),password=req.body.password;if(name.length<2||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||typeof password!=='string'||password.length<8)return error(res,400,'Enter a name, valid email, and password of at least 8 characters');const hash=await bcrypt.hash(password,12);try{const r=await rows('INSERT INTO users (name,email,password_hash,role) VALUES (?,?,?,"student")',[name,email,hash]);const user={id:r.insertId,name,email,role:'student'};res.status(201).json({token:tokenFor(user),user})}catch(e){if(e.code==='23505')return error(res,409,'Email already registered');throw e}}));
 app.post('/api/auth/login',run(async(req,res)=>{const email=text(req.body.email,190).toLowerCase();const u=(await rows('SELECT * FROM users WHERE email=?',[email]))[0];if(!u||!u.active||!await bcrypt.compare(String(req.body.password||''),u.password_hash))return error(res,401,'Incorrect email or password');const user={id:u.id,name:u.name,email:u.email,role:u.role};res.json({token:tokenFor(user),user})}));
